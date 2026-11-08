@@ -1,0 +1,528 @@
+-- ============================================================================
+-- 0. SCHEMA INITIALIZATION
+-- ============================================================================
+DROP SCHEMA IF EXISTS zarafshon_dw CASCADE;
+DROP SCHEMA
+CREATE SCHEMA zarafshon_dw;
+CREATE SCHEMA
+SET search_path TO zarafshon_dw;
+SET
+-- ============================================================================
+-- 1. MASTER CUSTOMER IDENTITY RESOLUTION (MDM CROSSWALK)
+-- Unifies the 5 disparate source identifiers across Zarafshon Bank using
+-- PINFL + Passport (from KYC) as the Golden Record anchor.
+-- ============================================================================
+CREATE TABLE mdm_customer_crosswalk (
+    master_customer_id SERIAL PRIMARY KEY,
+    pinfl              CHAR(14) NOT NULL UNIQUE,      -- KYC / Central Bank golden identifier
+    passport_no        VARCHAR(15) NOT NULL,          -- KYC passport number
+    client_no          BIGINT UNIQUE,                 -- Core banking (ABS) numeric ID
+    card_holder_id     VARCHAR(32) UNIQUE,            -- Card processing ID
+    pan_token          VARCHAR(64),                   -- Tokenized card PAN
+    app_user_id        UUID UNIQUE,                   -- Mobile app UUID
+    phone_number       VARCHAR(20),                   -- Mobile app / CRM phone
+    crm_id             VARCHAR(32) UNIQUE,            -- CRM system identifier
+    customer_type      VARCHAR(20) NOT NULL CHECK (customer_type IN ('Retail', 'Business')),
+    full_name          TEXT NOT NULL,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE TABLE
+INSERT INTO mdm_customer_crosswalk (
+    pinfl, passport_no, client_no, card_holder_id, pan_token,
+    app_user_id, phone_number, crm_id, customer_type, full_name
+) VALUES
+    ('31810056230078', 'AD0953216', 100001, 'CH-9001', 'TOK-8600-1111', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '+998901112233', 'CRM-5001', 'Retail',   'Aliyev Sardor'),
+    ('41205981120045', 'AB1234567', 100002, 'CH-9002', 'TOK-8600-2222', 'b1eebc99-9c0b-4ef8-bb6d-6bb9bd380a22', '+998934445566', 'CRM-5002', 'Retail',   'Karimova Nilufar'),
+    ('30503854410012', 'AC7654321', 100003, 'CH-9003', 'TOK-9860-3333', 'c2eebc99-9c0b-4ef8-bb6d-6bb9bd380a33', '+998977778899', 'CRM-5003', 'Business', 'OOO Zarafshon Agro Trade'),
+    ('42511923310089', 'AD8889900', 100004, 'CH-9004', 'TOK-9860-4444', 'd3eebc99-9c0b-4ef8-bb6d-6bb9bd380a44', '+998991234567', 'CRM-5004', 'Retail',   'Ergashev Bobur');
+INSERT 0 4
+-- ============================================================================
+-- 2. CORE DIMENSIONS (dim_date, dim_branch, dim_loan_product, dim_merchant)
+-- ============================================================================
+-- 2.1. dim_date (Covers 2024–2026 for 24-month rolling balance analysis)
+CREATE TABLE dim_date (
+    date_key      INTEGER PRIMARY KEY,
+    full_date     DATE NOT NULL UNIQUE,
+    year          SMALLINT NOT NULL,
+    quarter       SMALLINT NOT NULL,
+    month_num     SMALLINT NOT NULL,
+    year_month    CHAR(7) NOT NULL,                   -- Format: 'YYYY-MM'
+    day_of_month  SMALLINT NOT NULL,
+    is_weekend    BOOLEAN NOT NULL
+);
+CREATE TABLE
+INSERT INTO dim_date (
+    date_key, full_date, year, quarter, month_num, year_month, day_of_month, is_weekend
+)
+SELECT
+    TO_CHAR(d, 'YYYYMMDD')::INTEGER   AS date_key,
+    d::DATE                           AS full_date,
+    EXTRACT(YEAR FROM d)::SMALLINT    AS year,
+    EXTRACT(QUARTER FROM d)::SMALLINT AS quarter,
+    EXTRACT(MONTH FROM d)::SMALLINT   AS month_num,
+    TO_CHAR(d, 'YYYY-MM')             AS year_month,
+    EXTRACT(DAY FROM d)::SMALLINT     AS day_of_month,
+    CASE WHEN EXTRACT(ISODOW FROM d) IN (6, 7) THEN TRUE ELSE FALSE END AS is_weekend
+FROM generate_series(DATE '2024-01-01', DATE '2026-12-31', INTERVAL '1 day') AS gs(d);
+INSERT 0 1096
+-- 2.2. dim_branch (120 branches across Uzbekistan regions — sample subset)
+CREATE TABLE dim_branch (
+    branch_key    SERIAL PRIMARY KEY,
+    branch_code   VARCHAR(16) NOT NULL UNIQUE,
+    branch_name   TEXT NOT NULL,
+    region        TEXT NOT NULL,
+    city          TEXT NOT NULL
+);
+CREATE TABLE
+INSERT INTO dim_branch (branch_code, branch_name, region, city) VALUES
+    ('BR-001', 'Toshkent Bosh Amaliyot', 'Toshkent shahri',    'Toshkent'),
+    ('BR-002', 'Chilonzor Filiali',      'Toshkent shahri',    'Toshkent'),
+    ('BR-015', 'Samarqand Registon',     'Samarqand viloyati', 'Samarqand'),
+    ('BR-028', 'Buxoro Markaziy',        'Buxoro viloyati',    'Buxoro'),
+    ('BR-042', 'Navoiy Sanoat Filiali',  'Navoiy viloyati',    'Navoiy');
+INSERT 0 5
+-- 2.3. dim_loan_product
+CREATE TABLE dim_loan_product (
+    loan_product_key  SERIAL PRIMARY KEY,
+    product_code      VARCHAR(20) NOT NULL UNIQUE,
+    product_name      TEXT NOT NULL,
+    product_category  TEXT NOT NULL,                  -- 'Mortgage', 'Auto', 'SME Working Capital', 'Microloan'
+    target_sla_hours  INTEGER NOT NULL
+);
+CREATE TABLE
+INSERT INTO dim_loan_product (product_code, product_name, product_category, target_sla_hours) VALUES
+    ('LN-MICRO', 'Tezkor Mikroqarz',       'Microloan',           24),
+    ('LN-AUTO',  'Avtokredit Standart',    'Auto',                72),
+    ('LN-MORT',  'Ipoteka Uy-Joy',         'Mortgage',            168),
+    ('LN-SME',   'Biznes Aylanma Mablag''', 'SME Working Capital', 120);
+INSERT 0 4
+-- 2.4. dim_merchant (For Card Processing transactions & declines)
+CREATE TABLE dim_merchant (
+    merchant_key      SERIAL PRIMARY KEY,
+    merchant_id       VARCHAR(32) NOT NULL UNIQUE,
+    merchant_name     TEXT NOT NULL,
+    mcc_code          CHAR(4) NOT NULL,
+    merchant_category TEXT NOT NULL                   -- 'Groceries', 'E-Commerce', 'ATM Cash', 'Utilities', 'Restaurants'
+);
+CREATE TABLE
+INSERT INTO dim_merchant (merchant_id, merchant_name, mcc_code, merchant_category) VALUES
+    ('MRC-101', 'Korzinka Supermarket', '5411', 'Groceries'),
+    ('MRC-102', 'Uzum Market Online',   '5311', 'E-Commerce'),
+    ('MRC-103', 'Zarafshon ATM #045',   '6011', 'ATM Cash'),
+    ('MRC-104', 'Hududgazta''minot',    '4900', 'Utilities'),
+    ('MRC-105', 'Rayhon Milliy Taomlar','5812', 'Restaurants');
+INSERT 0 5
+-- ============================================================================
+-- 3. CUSTOMER SCD TYPE 2 + SOURCE-SYSTEM LINEAGE (ANSWERS QUESTION 5)
+-- Tracks complete history of (branch_code, segment, risk_rating) AND records
+-- exactly which source system ('ABS', 'CRM', 'KYC') provided each change and when.
+-- ============================================================================
+CREATE TABLE dim_customer_scd2 (
+    customer_sk        SERIAL PRIMARY KEY,
+    master_customer_id INTEGER NOT NULL REFERENCES mdm_customer_crosswalk(master_customer_id),
+    pinfl              CHAR(14) NOT NULL,
+    full_name          TEXT NOT NULL,
+    branch_code        VARCHAR(16) NOT NULL,          -- Sourced from Core banking (ABS)
+    branch_source_sys  VARCHAR(20) NOT NULL DEFAULT 'Core banking (ABS)',
+    branch_updated_at  TIMESTAMPTZ NOT NULL,
+    segment            VARCHAR(30) NOT NULL,          -- Sourced from CRM ('Mass', 'Affluent', 'VIP', 'SME')
+    segment_source_sys VARCHAR(20) NOT NULL DEFAULT 'CRM',
+    segment_updated_at TIMESTAMPTZ NOT NULL,
+    risk_rating        VARCHAR(15) NOT NULL,          -- Sourced from KYC / compliance ('Low', 'Medium', 'High')
+    risk_source_sys    VARCHAR(20) NOT NULL DEFAULT 'KYC / compliance',
+    risk_updated_at    TIMESTAMPTZ NOT NULL,
+    changed_attribute  VARCHAR(30) NOT NULL,          -- Which attribute triggered this SCD2 version
+    change_source_sys  VARCHAR(30) NOT NULL,          -- Authoritative source system for this version event
+    effective_from     TIMESTAMPTZ NOT NULL,
+    effective_to       TIMESTAMPTZ NOT NULL DEFAULT TIMESTAMPTZ '9999-12-31 23:59:59+05',
+    is_current         BOOLEAN NOT NULL DEFAULT TRUE
+);
+CREATE TABLE
+CREATE UNIQUE INDEX uq_dim_customer_scd2_current
+    ON dim_customer_scd2 (master_customer_id)
+    WHERE is_current = TRUE;
+CREATE INDEX
+-- Populate multi-version SCD Type 2 history for Customer 1 (Aliyev Sardor) and others
+INSERT INTO dim_customer_scd2 (
+    master_customer_id, pinfl, full_name,
+    branch_code, branch_source_sys, branch_updated_at,
+    segment, segment_source_sys, segment_updated_at,
+    risk_rating, risk_source_sys, risk_updated_at,
+    changed_attribute, change_source_sys,
+    effective_from, effective_to, is_current
+) VALUES
+    -- Customer 1 Version 1: Initial onboarding (2025-01-10)
+    (1, '31810056230078', 'Aliyev Sardor',
+     'BR-002', 'Core banking (ABS)', TIMESTAMPTZ '2025-01-10 01:00:00+05',
+     'Mass',   'CRM',                TIMESTAMPTZ '2025-01-10 09:15:00+05',
+     'Low',    'KYC / compliance',   TIMESTAMPTZ '2025-01-10 09:00:00+05',
+     'INITIAL_LOAD', 'ALL (ABS/CRM/KYC)',
+     TIMESTAMPTZ '2025-01-10 09:00:00+05', TIMESTAMPTZ '2025-08-14 18:29:59+05', FALSE),
+    -- Customer 1 Version 2: Upgraded segment from 'Mass' to 'Affluent' in CRM (2025-08-14)
+    (1, '31810056230078', 'Aliyev Sardor',
+     'BR-002',   'Core banking (ABS)', TIMESTAMPTZ '2025-01-10 01:00:00+05',
+     'Affluent', 'CRM',                TIMESTAMPTZ '2025-08-14 18:30:00+05',
+     'Low',      'KYC / compliance',   TIMESTAMPTZ '2025-01-10 09:00:00+05',
+     'segment', 'CRM',
+     TIMESTAMPTZ '2025-08-14 18:30:00+05', TIMESTAMPTZ '2026-03-01 00:59:59+05', FALSE),
+    -- Customer 1 Version 3: Transferred branch of record to BR-001 in ABS (2026-03-01)
+    (1, '31810056230078', 'Aliyev Sardor',
+     'BR-001',   'Core banking (ABS)', TIMESTAMPTZ '2026-03-01 01:00:00+05',
+     'Affluent', 'CRM',                TIMESTAMPTZ '2025-08-14 18:30:00+05',
+     'Low',      'KYC / compliance',   TIMESTAMPTZ '2025-01-10 09:00:00+05',
+     'branch_code', 'Core banking (ABS)',
+     TIMESTAMPTZ '2026-03-01 01:00:00+05', TIMESTAMPTZ '2026-09-19 14:19:59+05', FALSE),
+    -- Customer 1 Version 4 (Current): Risk rating raised to 'Medium' by KYC / compliance (2026-09-19)
+    (1, '31810056230078', 'Aliyev Sardor',
+     'BR-001',   'Core banking (ABS)', TIMESTAMPTZ '2026-03-01 01:00:00+05',
+     'Affluent', 'CRM',                TIMESTAMPTZ '2025-08-14 18:30:00+05',
+     'Medium',   'KYC / compliance',   TIMESTAMPTZ '2026-09-19 14:20:00+05',
+     'risk_rating', 'KYC / compliance',
+     TIMESTAMPTZ '2026-09-19 14:20:00+05', TIMESTAMPTZ '9999-12-31 23:59:59+05', TRUE),
+    -- Customer 2 (Current): Karimova Nilufar
+    (2, '41205981120045', 'Karimova Nilufar',
+     'BR-015', 'Core banking (ABS)', TIMESTAMPTZ '2025-02-01 01:00:00+05',
+     'VIP',    'CRM',                TIMESTAMPTZ '2025-02-01 10:00:00+05',
+     'Low',    'KYC / compliance',   TIMESTAMPTZ '2025-02-01 09:30:00+05',
+     'INITIAL_LOAD', 'ALL (ABS/CRM/KYC)',
+     TIMESTAMPTZ '2025-02-01 10:00:00+05', TIMESTAMPTZ '9999-12-31 23:59:59+05', TRUE),
+    -- Customer 3 (Current): OOO Zarafshon Agro Trade
+    (3, '30503854410012', 'OOO Zarafshon Agro Trade',
+     'BR-028', 'Core banking (ABS)', TIMESTAMPTZ '2025-01-15 01:00:00+05',
+     'SME',    'CRM',                TIMESTAMPTZ '2025-01-15 11:00:00+05',
+     'Low',    'KYC / compliance',   TIMESTAMPTZ '2025-01-15 10:30:00+05',
+     'INITIAL_LOAD', 'ALL (ABS/CRM/KYC)',
+     TIMESTAMPTZ '2025-01-15 11:00:00+05', TIMESTAMPTZ '9999-12-31 23:59:59+05', TRUE),
+    -- Customer 4 (Current): Ergashev Bobur
+    (4, '42511923310089', 'Ergashev Bobur',
+     'BR-042', 'Core banking (ABS)', TIMESTAMPTZ '2025-03-10 01:00:00+05',
+     'Mass',   'CRM',                TIMESTAMPTZ '2025-03-10 12:00:00+05',
+     'Low',    'KYC / compliance',   TIMESTAMPTZ '2025-03-10 11:45:00+05',
+     'INITIAL_LOAD', 'ALL (ABS/CRM/KYC)',
+     TIMESTAMPTZ '2025-03-10 12:00:00+05', TIMESTAMPTZ '9999-12-31 23:59:59+05', TRUE);
+INSERT 0 7
+-- ============================================================================
+-- 4. FACT TABLES FOR MANAGEMENT QUESTIONS 1–4
+-- ============================================================================
+-- 4.1. fact_deposit_flows (Transaction Grain — Supports Question 1)
+--      Loaded every night after the 01:00 ABS batch + daily CRM segment sync,
+--      ensuring yesterday's net deposit inflow is ready well before 08:00.
+CREATE TABLE fact_deposit_flows (
+    deposit_flow_id    BIGSERIAL PRIMARY KEY,
+    date_key           INTEGER NOT NULL REFERENCES dim_date(date_key),
+    branch_key         INTEGER NOT NULL REFERENCES dim_branch(branch_key),
+    customer_sk        INTEGER NOT NULL REFERENCES dim_customer_scd2(customer_sk),
+    account_no         VARCHAR(30) NOT NULL,
+    inflow_amount_uzs  NUMERIC(18, 2) NOT NULL DEFAULT 0.00 CHECK (inflow_amount_uzs >= 0),
+    outflow_amount_uzs NUMERIC(18, 2) NOT NULL DEFAULT 0.00 CHECK (outflow_amount_uzs >= 0),
+    batch_loaded_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE TABLE
+INSERT INTO fact_deposit_flows (
+    date_key, branch_key, customer_sk, account_no, inflow_amount_uzs, outflow_amount_uzs, batch_loaded_at
+) VALUES
+    (20261106, 1, 4, 'ACC-1001',  85000000.00, 15000000.00, TIMESTAMPTZ '2026-11-07 02:15:00+05'),
+    (20261106, 3, 5, 'ACC-2001', 120000000.00, 20000000.00, TIMESTAMPTZ '2026-11-07 02:15:00+05'),
+    (20261106, 4, 6, 'ACC-3001', 450000000.00, 90000000.00, TIMESTAMPTZ '2026-11-07 02:15:00+05'),
+    (20261107, 1, 4, 'ACC-1001',  95000000.00, 10000000.00, TIMESTAMPTZ '2026-11-08 02:10:00+05'),
+    (20261107, 2, 4, 'ACC-1002',  40000000.00,  5000000.00, TIMESTAMPTZ '2026-11-08 02:10:00+05'),
+    (20261107, 3, 5, 'ACC-2001', 160000000.00, 35000000.00, TIMESTAMPTZ '2026-11-08 02:10:00+05'),
+    (20261107, 4, 6, 'ACC-3001', 620000000.00, 120000000.00, TIMESTAMPTZ '2026-11-08 02:10:00+05'),
+    (20261107, 5, 7, 'ACC-4001',  30000000.00,  8000000.00, TIMESTAMPTZ '2026-11-08 02:10:00+05');
+INSERT 0 8
+-- 4.2. fact_daily_account_balances (Periodic Snapshot Fact — Supports Question 2)
+--      Stores end-of-day (EOD) balance per account per day over the last 24 months.
+CREATE TABLE fact_daily_account_balances (
+    balance_snapshot_id BIGSERIAL PRIMARY KEY,
+    date_key            INTEGER NOT NULL REFERENCES dim_date(date_key),
+    master_customer_id  INTEGER NOT NULL REFERENCES mdm_customer_crosswalk(master_customer_id),
+    branch_key          INTEGER NOT NULL REFERENCES dim_branch(branch_key),
+    account_no          VARCHAR(30) NOT NULL,
+    eod_balance_uzs     NUMERIC(18, 2) NOT NULL,
+    UNIQUE (date_key, account_no)
+);
+CREATE TABLE
+-- Seed 24 months (Nov 2024 – Oct 2026) of sample end-of-day snapshots using generate_series
+INSERT INTO fact_daily_account_balances (
+    date_key, master_customer_id, branch_key, account_no, eod_balance_uzs
+)
+SELECT
+    TO_CHAR(d, 'YYYYMMDD')::INTEGER AS date_key,
+    c.master_customer_id,
+    c.branch_key,
+    c.account_no,
+    (c.base_balance + (EXTRACT(MONTH FROM d) * 1500000) + (EXTRACT(DAY FROM d) * 100000))::NUMERIC(18, 2) AS eod_balance_uzs
+FROM generate_series(DATE '2024-11-01', DATE '2026-10-31', INTERVAL '15 days') AS gs(d)
+CROSS JOIN (
+    VALUES
+        (1, 1, 'ACC-1001',  45000000.00),
+        (2, 3, 'ACC-2001', 110000000.00),
+        (3, 4, 'ACC-3001', 520000000.00),
+        (4, 5, 'ACC-4001',  18000000.00)
+) AS c(master_customer_id, branch_key, account_no, base_balance);
+INSERT 0 196
+-- 4.3. fact_card_transactions (Streaming Event Grain — Supports Question 3)
+--      Ingested from Kafka card processing stream (~7M events/day) with <5 min latency.
+CREATE TABLE fact_card_transactions (
+    card_tx_id         BIGSERIAL PRIMARY KEY,
+    event_id           VARCHAR(40) NOT NULL UNIQUE,
+    event_timestamp    TIMESTAMPTZ NOT NULL,
+    ingested_at        TIMESTAMPTZ NOT NULL,
+    master_customer_id INTEGER NOT NULL REFERENCES mdm_customer_crosswalk(master_customer_id),
+    merchant_key       INTEGER NOT NULL REFERENCES dim_merchant(merchant_key),
+    amount_uzs         NUMERIC(18, 2) NOT NULL,
+    tx_status          VARCHAR(16) NOT NULL CHECK (tx_status IN ('APPROVED', 'DECLINED')),
+    decline_reason     VARCHAR(50)
+);
+CREATE TABLE
+CREATE INDEX idx_card_tx_event_ts ON fact_card_transactions (event_timestamp, merchant_key, tx_status);
+CREATE INDEX
+INSERT INTO fact_card_transactions (
+    event_id, event_timestamp, ingested_at, master_customer_id, merchant_key, amount_uzs, tx_status, decline_reason
+) VALUES
+    ('KFK-90001', TIMESTAMPTZ '2026-11-08 06:10:12+05', TIMESTAMPTZ '2026-11-08 06:10:15+05', 1, 1,  250000.00, 'APPROVED', NULL),
+    ('KFK-90002', TIMESTAMPTZ '2026-11-08 06:18:40+05', TIMESTAMPTZ '2026-11-08 06:18:44+05', 2, 1,  480000.00, 'APPROVED', NULL),
+    ('KFK-90003', TIMESTAMPTZ '2026-11-08 06:25:05+05', TIMESTAMPTZ '2026-11-08 06:25:09+05', 4, 1,  920000.00, 'DECLINED', 'INSUFFICIENT_FUNDS'),
+    ('KFK-90004', TIMESTAMPTZ '2026-11-08 06:05:19+05', TIMESTAMPTZ '2026-11-08 06:05:22+05', 1, 2, 1500000.00, 'DECLINED', '3DS_TIMEOUT'),
+    ('KFK-90005', TIMESTAMPTZ '2026-11-08 06:32:50+05', TIMESTAMPTZ '2026-11-08 06:32:54+05', 2, 2, 2100000.00, 'DECLINED', 'FRAUD_RULE_BLOCK'),
+    ('KFK-90006', TIMESTAMPTZ '2026-11-08 06:44:10+05', TIMESTAMPTZ '2026-11-08 06:44:13+05', 3, 2,  750000.00, 'APPROVED', NULL),
+    ('KFK-90007', TIMESTAMPTZ '2026-11-08 07:02:11+05', TIMESTAMPTZ '2026-11-08 07:02:14+05', 1, 3, 1000000.00, 'APPROVED', NULL),
+    ('KFK-90008', TIMESTAMPTZ '2026-11-08 07:11:30+05', TIMESTAMPTZ '2026-11-08 07:11:35+05', 4, 3, 5000000.00, 'DECLINED', 'DAILY_LIMIT_EXCEEDED'),
+    ('KFK-90009', TIMESTAMPTZ '2026-11-08 07:15:00+05', TIMESTAMPTZ '2026-11-08 07:15:03+05', 2, 4,  320000.00, 'APPROVED', NULL);
+INSERT 0 9
+-- 4.4. fact_loan_pipeline (Accumulating Snapshot Fact — Supports Question 4)
+--      One row per loan application tracking all stage timestamps from application
+--      to disbursement, plus current stage for stalled applications.
+CREATE TABLE fact_loan_pipeline (
+    loan_app_id          VARCHAR(24) PRIMARY KEY,
+    master_customer_id   INTEGER NOT NULL REFERENCES mdm_customer_crosswalk(master_customer_id),
+    branch_key           INTEGER NOT NULL REFERENCES dim_branch(branch_key),
+    loan_product_key     INTEGER NOT NULL REFERENCES dim_loan_product(loan_product_key),
+    requested_amount_uzs NUMERIC(18, 2) NOT NULL,
+    applied_at           TIMESTAMPTZ NOT NULL,
+    kyc_completed_at     TIMESTAMPTZ,
+    underwriting_at      TIMESTAMPTZ,
+    approved_at          TIMESTAMPTZ,
+    disbursed_at         TIMESTAMPTZ,
+    current_stage        VARCHAR(30) NOT NULL CHECK (
+                             current_stage IN ('1_APPLIED', '2_KYC_CHECK', '3_UNDERWRITING', '4_APPROVED', '5_DISBURSED')
+                         )
+);
+CREATE TABLE
+INSERT INTO fact_loan_pipeline (
+    loan_app_id, master_customer_id, branch_key, loan_product_key, requested_amount_uzs,
+    applied_at, kyc_completed_at, underwriting_at, approved_at, disbursed_at, current_stage
+) VALUES
+    ('LN-2026-001', 1, 1, 1,  25000000.00,
+     TIMESTAMPTZ '2026-10-10 09:00:00+05', TIMESTAMPTZ '2026-10-10 10:30:00+05',
+     TIMESTAMPTZ '2026-10-10 14:00:00+05', TIMESTAMPTZ '2026-10-10 16:00:00+05',
+     TIMESTAMPTZ '2026-10-10 17:30:00+05', '5_DISBURSED'),
+    ('LN-2026-002', 2, 3, 2, 180000000.00,
+     TIMESTAMPTZ '2026-10-12 10:00:00+05', TIMESTAMPTZ '2026-10-12 15:00:00+05',
+     TIMESTAMPTZ '2026-10-14 11:00:00+05', TIMESTAMPTZ '2026-10-14 17:00:00+05',
+     TIMESTAMPTZ '2026-10-15 11:00:00+05', '5_DISBURSED'),
+    ('LN-2026-003', 3, 4, 4, 950000000.00,
+     TIMESTAMPTZ '2026-10-15 09:30:00+05', TIMESTAMPTZ '2026-10-16 12:30:00+05',
+     TIMESTAMPTZ '2026-10-20 16:30:00+05', TIMESTAMPTZ '2026-10-21 10:30:00+05',
+     TIMESTAMPTZ '2026-10-22 09:30:00+05', '5_DISBURSED'),
+    -- Stalled in Underwriting stage
+    ('LN-2026-004', 4, 5, 3, 420000000.00,
+     TIMESTAMPTZ '2026-10-25 11:00:00+05', TIMESTAMPTZ '2026-10-26 09:00:00+05',
+     NULL, NULL, NULL, '3_UNDERWRITING'),
+    -- Stalled in KYC check stage
+    ('LN-2026-005', 3, 4, 4, 600000000.00,
+     TIMESTAMPTZ '2026-11-01 14:00:00+05', NULL,
+     NULL, NULL, NULL, '2_KYC_CHECK');
+INSERT 0 5
+-- ============================================================================
+-- 5. ANALYTICAL QUERIES ANSWERING MANAGEMENT QUESTIONS 1–5
+-- ============================================================================
+-- ----------------------------------------------------------------------------
+-- QUESTION 1: Daily net inflow of deposits by region and by customer segment,
+--             with yesterday's figure available by 08:00.
+-- ----------------------------------------------------------------------------
+SELECT
+    d.full_date                                                     AS report_date,
+    b.region,
+    c.segment                                                       AS customer_segment,
+    SUM(f.inflow_amount_uzs)                                        AS total_inflow_uzs,
+    SUM(f.outflow_amount_uzs)                                       AS total_outflow_uzs,
+    SUM(f.inflow_amount_uzs - f.outflow_amount_uzs)                 AS net_inflow_uzs,
+    MAX(TO_CHAR(f.batch_loaded_at, 'YYYY-MM-DD HH24:MI'))           AS available_at_local,
+    CASE
+        WHEN MAX(EXTRACT(HOUR FROM f.batch_loaded_at)) < 8 THEN 'MET (<08:00 SLA)'
+        ELSE 'BREACHED'
+    END                                                             AS sla_status
+FROM fact_deposit_flows f
+JOIN dim_date d          ON d.date_key    = f.date_key
+JOIN dim_branch b        ON b.branch_key  = f.branch_key
+JOIN dim_customer_scd2 c ON c.customer_sk = f.customer_sk
+WHERE d.full_date = DATE '2026-11-07'
+GROUP BY d.full_date, b.region, c.segment
+ORDER BY net_inflow_uzs DESC;
+ report_date |       region       | customer_segment | total_inflow_uzs | total_outflow_uzs | net_inflow_uzs | available_at_local | sla_status 
+-------------+--------------------+------------------+------------------+-------------------+----------------+--------------------+------------
+ 2026-11-07  | Buxoro viloyati    | SME              |     620000000.00 |      120000000.00 |   500000000.00 | 2026-11-07 21:10   | BREACHED
+ 2026-11-07  | Samarqand viloyati | VIP              |     160000000.00 |       35000000.00 |   125000000.00 | 2026-11-07 21:10   | BREACHED
+ 2026-11-07  | Toshkent shahri    | Affluent         |     135000000.00 |       15000000.00 |   120000000.00 | 2026-11-07 21:10   | BREACHED
+ 2026-11-07  | Navoiy viloyati    | Mass             |      30000000.00 |        8000000.00 |    22000000.00 | 2026-11-07 21:10   | BREACHED
+(4 rows)
+
+-- ----------------------------------------------------------------------------
+-- QUESTION 2: Average monthly balance per customer and per branch
+--             for the last 24 months (Nov 2024 – Oct 2026).
+-- ----------------------------------------------------------------------------
+SELECT
+    d.year_month,
+    b.branch_code,
+    b.branch_name,
+    m.pinfl,
+    m.full_name                                                     AS customer_name,
+    ROUND(AVG(s.eod_balance_uzs), 2)                                AS avg_monthly_customer_balance_uzs,
+    ROUND(
+        AVG(AVG(s.eod_balance_uzs)) OVER (PARTITION BY d.year_month, b.branch_key),
+        2
+    )                                                               AS avg_monthly_branch_balance_uzs
+FROM fact_daily_account_balances s
+JOIN dim_date d               ON d.date_key           = s.date_key
+JOIN dim_branch b             ON b.branch_key         = s.branch_key
+JOIN mdm_customer_crosswalk m ON m.master_customer_id = s.master_customer_id
+WHERE d.full_date BETWEEN DATE '2024-11-01' AND DATE '2026-10-31'
+GROUP BY d.year_month, b.branch_key, b.branch_code, b.branch_name, m.pinfl, m.full_name
+ORDER BY d.year_month DESC, b.branch_code, m.pinfl
+LIMIT 15;
+ year_month | branch_code |      branch_name       |     pinfl      |      customer_name       | avg_monthly_customer_balance_uzs | avg_monthly_branch_balance_uzs 
+------------+-------------+------------------------+----------------+--------------------------+----------------------------------+--------------------------------
+ 2026-10    | BR-001      | Toshkent Bosh Amaliyot | 31810056230078 | Aliyev Sardor            |                      61450000.00 |                    61450000.00
+ 2026-10    | BR-015      | Samarqand Registon     | 41205981120045 | Karimova Nilufar         |                     126450000.00 |                   126450000.00
+ 2026-10    | BR-028      | Buxoro Markaziy        | 30503854410012 | OOO Zarafshon Agro Trade |                     536450000.00 |                   536450000.00
+ 2026-10    | BR-042      | Navoiy Sanoat Filiali  | 42511923310089 | Ergashev Bobur           |                      34450000.00 |                    34450000.00
+ 2026-09    | BR-001      | Toshkent Bosh Amaliyot | 31810056230078 | Aliyev Sardor            |                      59950000.00 |                    59950000.00
+ 2026-09    | BR-015      | Samarqand Registon     | 41205981120045 | Karimova Nilufar         |                     124950000.00 |                   124950000.00
+ 2026-09    | BR-028      | Buxoro Markaziy        | 30503854410012 | OOO Zarafshon Agro Trade |                     534950000.00 |                   534950000.00
+ 2026-09    | BR-042      | Navoiy Sanoat Filiali  | 42511923310089 | Ergashev Bobur           |                      32950000.00 |                    32950000.00
+ 2026-08    | BR-001      | Toshkent Bosh Amaliyot | 31810056230078 | Aliyev Sardor            |                      58550000.00 |                    58550000.00
+ 2026-08    | BR-015      | Samarqand Registon     | 41205981120045 | Karimova Nilufar         |                     123550000.00 |                   123550000.00
+ 2026-08    | BR-028      | Buxoro Markaziy        | 30503854410012 | OOO Zarafshon Agro Trade |                     533550000.00 |                   533550000.00
+ 2026-08    | BR-042      | Navoiy Sanoat Filiali  | 42511923310089 | Ergashev Bobur           |                      31550000.00 |                    31550000.00
+ 2026-07    | BR-001      | Toshkent Bosh Amaliyot | 31810056230078 | Aliyev Sardor            |                      57150000.00 |                    57150000.00
+ 2026-07    | BR-015      | Samarqand Registon     | 41205981120045 | Karimova Nilufar         |                     122150000.00 |                   122150000.00
+ 2026-07    | BR-028      | Buxoro Markaziy        | 30503854410012 | OOO Zarafshon Agro Trade |                     532150000.00 |                   532150000.00
+(15 rows)
+
+-- ----------------------------------------------------------------------------
+-- QUESTION 3: Share of card transactions declined, by merchant category and
+--             hour of day, within 5 minutes of the event.
+-- ----------------------------------------------------------------------------
+SELECT
+    DATE_TRUNC('hour', t.event_timestamp)                           AS hour_bucket,
+    EXTRACT(HOUR FROM t.event_timestamp)::INTEGER                   AS hour_of_day,
+    m.merchant_category,
+    COUNT(*)                                                        AS total_transactions,
+    COUNT(*) FILTER (WHERE t.tx_status = 'DECLINED')                AS declined_transactions,
+    ROUND(
+        100.0 * COUNT(*) FILTER (WHERE t.tx_status = 'DECLINED') / NULLIF(COUNT(*), 0),
+        2
+    )                                                               AS decline_share_pct,
+    ROUND(
+        AVG(EXTRACT(EPOCH FROM (t.ingested_at - t.event_timestamp))),
+        2
+    )                                                               AS avg_stream_latency_sec
+FROM fact_card_transactions t
+JOIN dim_merchant m ON m.merchant_key = t.merchant_key
+WHERE t.ingested_at <= t.event_timestamp + INTERVAL '5 minutes'
+GROUP BY DATE_TRUNC('hour', t.event_timestamp), EXTRACT(HOUR FROM t.event_timestamp), m.merchant_category
+ORDER BY hour_bucket, decline_share_pct DESC;
+      hour_bucket       | hour_of_day | merchant_category | total_transactions | declined_transactions | decline_share_pct | avg_stream_latency_sec 
+------------------------+-------------+-------------------+--------------------+-----------------------+-------------------+------------------------
+ 2026-11-08 01:00:00+00 |           1 | E-Commerce        |                  3 |                     2 |             66.67 |                   3.33
+ 2026-11-08 01:00:00+00 |           1 | Groceries         |                  3 |                     1 |             33.33 |                   3.67
+ 2026-11-08 02:00:00+00 |           2 | ATM Cash          |                  2 |                     1 |             50.00 |                   4.00
+ 2026-11-08 02:00:00+00 |           2 | Utilities         |                  1 |                     0 |              0.00 |                   3.00
+(4 rows)
+
+-- ----------------------------------------------------------------------------
+-- QUESTION 4A: Time from loan application to disbursement, by branch and loan product
+-- ----------------------------------------------------------------------------
+SELECT
+    b.branch_code,
+    b.branch_name,
+    lp.product_category,
+    COUNT(*) FILTER (WHERE f.current_stage = '5_DISBURSED')         AS disbursed_count,
+    ROUND(AVG(EXTRACT(EPOCH FROM (f.kyc_completed_at - f.applied_at)) / 3600.0), 1)       AS avg_kyc_hours,
+    ROUND(AVG(EXTRACT(EPOCH FROM (f.underwriting_at - f.kyc_completed_at)) / 3600.0), 1)  AS avg_underwriting_hours,
+    ROUND(AVG(EXTRACT(EPOCH FROM (f.approved_at - f.underwriting_at)) / 3600.0), 1)       AS avg_approval_hours,
+    ROUND(AVG(EXTRACT(EPOCH FROM (f.disbursed_at - f.applied_at)) / 3600.0), 1)           AS avg_total_hours_to_disburse,
+    lp.target_sla_hours
+FROM fact_loan_pipeline f
+JOIN dim_branch b        ON b.branch_key       = f.branch_key
+JOIN dim_loan_product lp ON lp.loan_product_key = f.loan_product_key
+WHERE f.current_stage = '5_DISBURSED'
+GROUP BY b.branch_code, b.branch_name, lp.product_category, lp.target_sla_hours
+ORDER BY avg_total_hours_to_disburse DESC;
+ branch_code |      branch_name       |  product_category   | disbursed_count | avg_kyc_hours | avg_underwriting_hours | avg_approval_hours | avg_total_hours_to_disburse | target_sla_hours 
+-------------+------------------------+---------------------+-----------------+---------------+------------------------+--------------------+-----------------------------+------------------
+ BR-028      | Buxoro Markaziy        | SME Working Capital |               1 |          27.0 |                  100.0 |               18.0 |                       168.0 |              120
+ BR-015      | Samarqand Registon     | Auto                |               1 |           5.0 |                   44.0 |                6.0 |                        73.0 |               72
+ BR-001      | Toshkent Bosh Amaliyot | Microloan           |               1 |           1.5 |                    3.5 |                2.0 |                         8.5 |               24
+(3 rows)
+
+-- ----------------------------------------------------------------------------
+-- QUESTION 4B: Bottleneck analysis — Where pending loan applications stall
+-- ----------------------------------------------------------------------------
+SELECT
+    f.current_stage                                                 AS stalled_at_stage,
+    b.branch_code,
+    lp.product_category,
+    COUNT(*)                                                        AS stalled_applications,
+    ROUND(
+        AVG(EXTRACT(EPOCH FROM (TIMESTAMPTZ '2026-11-08 07:00:00+05' - COALESCE(f.approved_at, f.underwriting_at, f.kyc_completed_at, f.applied_at))) / 3600.0),
+        1
+    )                                                               AS hours_stuck_in_current_stage
+FROM fact_loan_pipeline f
+JOIN dim_branch b        ON b.branch_key       = f.branch_key
+JOIN dim_loan_product lp ON lp.loan_product_key = f.loan_product_key
+WHERE f.current_stage <> '5_DISBURSED'
+GROUP BY f.current_stage, b.branch_code, lp.product_category
+ORDER BY hours_stuck_in_current_stage DESC;
+ stalled_at_stage | branch_code |  product_category   | stalled_applications | hours_stuck_in_current_stage 
+------------------+-------------+---------------------+----------------------+------------------------------
+ 3_UNDERWRITING   | BR-042      | Mortgage            |                    1 |                        310.0
+ 2_KYC_CHECK      | BR-028      | SME Working Capital |                    1 |                        161.0
+(2 rows)
+
+-- ----------------------------------------------------------------------------
+-- QUESTION 5: For any customer, the complete history of branch, segment, and
+--             risk rating, and which system each value came from and when.
+-- ----------------------------------------------------------------------------
+SELECT
+    c.pinfl,
+    c.full_name,
+    c.customer_sk                                                   AS version_sk,
+    c.branch_code,
+    c.branch_source_sys,
+    TO_CHAR(c.branch_updated_at, 'YYYY-MM-DD HH24:MI')              AS branch_as_of,
+    c.segment,
+    c.segment_source_sys,
+    TO_CHAR(c.segment_updated_at, 'YYYY-MM-DD HH24:MI')             AS segment_as_of,
+    c.risk_rating,
+    c.risk_source_sys,
+    TO_CHAR(c.risk_updated_at, 'YYYY-MM-DD HH24:MI')                AS risk_as_of,
+    c.changed_attribute,
+    c.change_source_sys,
+    TO_CHAR(c.effective_from, 'YYYY-MM-DD HH24:MI')                 AS version_start,
+    CASE
+        WHEN c.is_current THEN 'CURRENT'
+        ELSE TO_CHAR(c.effective_to, 'YYYY-MM-DD HH24:MI')
+    END                                                             AS version_end
+FROM dim_customer_scd2 c
+WHERE c.pinfl = '31810056230078'
+ORDER BY c.effective_from;
+     pinfl      |   full_name   | version_sk | branch_code | branch_source_sys  |   branch_as_of   | segment  | segment_source_sys |  segment_as_of   | risk_rating | risk_source_sys  |    risk_as_of    | changed_attribute | change_source_sys  |  version_start   |   version_end    
+----------------+---------------+------------+-------------+--------------------+------------------+----------+--------------------+------------------+-------------+------------------+------------------+-------------------+--------------------+------------------+------------------
+ 31810056230078 | Aliyev Sardor |          1 | BR-002      | Core banking (ABS) | 2025-01-09 20:00 | Mass     | CRM                | 2025-01-10 04:15 | Low         | KYC / compliance | 2025-01-10 04:00 | INITIAL_LOAD      | ALL (ABS/CRM/KYC)  | 2025-01-10 04:00 | 2025-08-14 13:29
+ 31810056230078 | Aliyev Sardor |          2 | BR-002      | Core banking (ABS) | 2025-01-09 20:00 | Affluent | CRM                | 2025-08-14 13:30 | Low         | KYC / compliance | 2025-01-10 04:00 | segment           | CRM                | 2025-08-14 13:30 | 2026-02-28 19:59
+ 31810056230078 | Aliyev Sardor |          3 | BR-001      | Core banking (ABS) | 2026-02-28 20:00 | Affluent | CRM                | 2025-08-14 13:30 | Low         | KYC / compliance | 2025-01-10 04:00 | branch_code       | Core banking (ABS) | 2026-02-28 20:00 | 2026-09-19 09:19
+ 31810056230078 | Aliyev Sardor |          4 | BR-001      | Core banking (ABS) | 2026-02-28 20:00 | Affluent | CRM                | 2025-08-14 13:30 | Medium      | KYC / compliance | 2026-09-19 09:20 | risk_rating       | KYC / compliance   | 2026-09-19 09:20 | CURRENT
+(4 rows)
+
